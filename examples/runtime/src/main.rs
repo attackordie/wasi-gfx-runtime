@@ -17,9 +17,13 @@ use wasmtime_wasi_io::IoView;
 
 #[derive(clap::Parser, Debug)]
 struct RuntimeArgs {
-    /// The example name
+    /// The example name (loads ./target/example-{name}.wasm)
     #[arg(long)]
-    example: String,
+    example: Option<String>,
+
+    /// Direct path to a WASM component file
+    #[arg(long)]
+    component: Option<String>,
 }
 
 wasmtime::component::bindgen!({
@@ -147,10 +151,14 @@ async fn main() -> anyhow::Result<()> {
 
     let mut store = Store::new(&engine, workload_state);
 
-    let wasm_path = format!("./target/example-{}.wasm", args.example);
+    let wasm_path = match (&args.component, &args.example) {
+        (Some(path), _) => path.clone(),
+        (_, Some(name)) => format!("./target/example-{}.wasm", name),
+        (None, None) => anyhow::bail!("Either --example or --component must be provided"),
+    };
 
     let component =
-        Component::from_file(&engine, &wasm_path).context("Component file not found")?;
+        Component::from_file(&engine, &wasm_path).map_err(|e| anyhow::anyhow!("Component file not found: {}", e))?;
 
     let instance = Example::instantiate_async(&mut store, &component, &linker)
         .await
