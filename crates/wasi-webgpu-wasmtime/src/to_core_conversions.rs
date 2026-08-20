@@ -665,8 +665,10 @@ impl<'a> ToCore<wgpu_types::DeviceDescriptor<wgpu_core::Label<'a>>>
                 .map(|limit| table.get(&limit).unwrap().to_core(table))
                 .unwrap_or(wgpu_types::Limits::defaults()),
             // TODO: use self.default_queue?
-            // memory_hints is not present in WebGPU
-            memory_hints: wgpu_types::MemoryHints::default(),
+            // memory_hints is not present in WebGPU. MemoryUsage keeps gpu_alloc's
+            // starting block small enough for low-memory adapters (e.g. Broadcom V3D
+            // on a Raspberry Pi, where the Performance default OOMs request-device).
+            memory_hints: wgpu_types::MemoryHints::MemoryUsage,
             // trace is not present in WebGPU
             trace: wgpu_types::Trace::default(),
             // Don't enable any experimental features
