@@ -22,6 +22,18 @@ pub use surface_frame_buffer::{
     SurfaceFrameBufferCtxView,
 };
 
+/// Re-exports for embedders whose own `bindgen!` worlds reference these
+/// interfaces (e.g. a guest export taking `borrow<context>`) and must
+/// `with`-map the resource types to this crate's, or typed instantiation
+/// fails with "resource type mismatch".
+pub mod reexports {
+    pub use crate::surface::wasi_gfx;
+    #[cfg(feature = "surface-frame-buffer")]
+    pub use crate::surface_frame_buffer::GfxContext as SurfaceFrameBufferContext;
+    #[cfg(feature = "surface-webgpu")]
+    pub use crate::surface_webgpu::Context as SurfaceWebgpuContext;
+}
+
 /// Add surface, surface-webgpu, surface-frame-buffer to the linker
 #[cfg(all(feature = "surface-webgpu", feature = "surface-frame-buffer"))]
 pub fn add_all_to_linker<T>(l: &mut wasmtime::component::Linker<T>) -> wasmtime::Result<()>
