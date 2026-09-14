@@ -965,6 +965,35 @@ impl<'a> webgpu::HostGpuAdapter for WasiWebGpuCtx<'a> {
     }
 }
 
+/// Maps a wgpu device-creation failure onto the WIT `request-device-error`
+/// instead of aborting the host.
+///
+/// https://www.w3.org/TR/webgpu/#dom-gpuadapter-requestdevice
+/// - step 1: `requiredFeatures` not a subset of the adapter's -> TypeError
+/// - step 3: `requiredLimits` not satisfiable -> OperationError
+/// - "the user agent otherwise cannot fulfill the request": the spec resolves
+///   with an already-lost device. This interface has no way to hand back a
+///   lost device, so every other failure (OutOfMemory on a low-memory
+///   adapter, Lost, backend init failures) is reported as an OperationError.
+///   The wgpu error enums are `#[non_exhaustive]`, so the wildcard arm is
+///   required; nothing here panics.
+fn map_request_device_error(
+    err: wgpu_core::instance::RequestDeviceError,
+) -> webgpu::RequestDeviceError {
+    use wgpu_core::instance::RequestDeviceError as CoreError;
+    let message = err.to_string();
+    let kind = match err {
+        CoreError::UnsupportedFeature(_) | CoreError::ExperimentalFeaturesNotEnabled(_) => {
+            webgpu::RequestDeviceErrorKind::TypeError
+        }
+        CoreError::LimitsExceeded(_) | CoreError::Device(_) => {
+            webgpu::RequestDeviceErrorKind::OperationError
+        }
+        _ => webgpu::RequestDeviceErrorKind::OperationError,
+    };
+    webgpu::RequestDeviceError { kind, message }
+}
+
 impl<T: Send> webgpu::HostGpuAdapterWithStore<T> for crate::HasWasiWebGpuCtx {
     async fn request_device(
         accessor: &Accessor<T, Self>,
@@ -994,38 +1023,7 @@ impl<T: Send> webgpu::HostGpuAdapterWithStore<T> for crate::HasWasiWebGpuCtx {
                     Ok(device)
                 }
 
-                Err(err) => {
-                    let message = err.to_string();
-                    // https://www.w3.org/TR/webgpu/#dom-gpuadapter-requestdevice
-                    match err {
-                        wgpu_core::instance::RequestDeviceError::LimitsExceeded(_) => {
-                            // From the spec:
-                            // > 1. If any of the following requirements are unmet:
-                            // >  - The set of values in descriptor.requiredFeatures must be a subset of those in adapter.[[features]].
-                            // > Then issue the following steps on contentTimeline and return:
-                            // >  1. Reject promise with a TypeError.
-                            Err(webgpu::RequestDeviceError {
-                                kind: webgpu::RequestDeviceErrorKind::TypeError,
-                                message,
-                            })
-                        }
-                        wgpu_core::instance::RequestDeviceError::UnsupportedFeature(_) => {
-                            // From the spec:
-                            // > 2. All of the requirements in the following steps must be met.
-                            // >  2. For each [key, value] in descriptor.requiredLimits for which value is not undefined:
-                            // >   1. key must be the name of a member of supported limits.
-                            // >   2. value must be no better than adapter.[[limits]][key].
-                            // >   3. If key’s class is alignment, value must be a power of 2 less than 232.
-                            // > 3. If any are unmet, issue the following steps on contentTimeline and return:
-                            // >  1. Reject promise with an OperationError.
-                            Err(webgpu::RequestDeviceError {
-                                kind: webgpu::RequestDeviceErrorKind::OperationError,
-                                message,
-                            })
-                        }
-                        err => todo!("unhandled request device error: {:#?}", err),
-                    }
-                }
+                Err(err) => Err(map_request_device_error(err)),
             })
         })
     }
@@ -3252,4 +3250,49 @@ mod tests {
         assert!(core.required_features.is_empty());
         assert!(core.label.is_none());
     }
+}
+
+#[cfg(test)]
+mod request_device_error_tests {
+    use super::*;
+    use webgpu::RequestDeviceErrorKind as Kind;
+    use wgpu_core::device::DeviceError;
+    use wgpu_core::instance::RequestDeviceError as CoreError;
+
+    #[test]
+    fn out_of_memory_reaches_the_guest_as_operation_error() {
+        // The failure low-memory adapters (Raspberry Pi V3D) hit at device
+        // creation. Before this mapping it aborted the host process.
+        let mapped = map_request_device_error(CoreError::Device(DeviceError::OutOfMemory));
+        assert!(matches!(mapped.kind, Kind::OperationError));
+        assert!(!mapped.message.is_empty());
+    }
+
+    #[test]
+    fn lost_device_reaches_the_guest_as_operation_error() {
+        let mapped = map_request_device_error(CoreError::Device(DeviceError::Lost));
+        assert!(matches!(mapped.kind, Kind::OperationError));
+    }
+
+    #[test]
+    fn unsupported_feature_is_a_type_error_per_spec() {
+        // https://www.w3.org/TR/webgpu/#dom-gpuadapter-requestdevice step 1:
+        // requiredFeatures not a subset of adapter features -> TypeError.
+        let mapped =
+            map_request_device_error(CoreError::UnsupportedFeature(wgpu_types::Features::empty()));
+        assert!(matches!(mapped.kind, Kind::TypeError));
+    }
+
+    #[test]
+    fn experimental_features_not_enabled_is_a_type_error() {
+        let mapped = map_request_device_error(CoreError::ExperimentalFeaturesNotEnabled(
+            wgpu_types::Features::empty(),
+        ));
+        assert!(matches!(mapped.kind, Kind::TypeError));
+    }
+
+    // LimitsExceeded(FailedLimit) cannot be constructed here (private fields);
+    // spec step 3 says OperationError and the arm is explicit in the mapping.
+    // The wgpu enums are #[non_exhaustive], so the wildcard arm (also
+    // OperationError) is what keeps a future wgpu variant from ever panicking.
 }
