@@ -6,7 +6,7 @@ use surface_wasmtime::{
     winit::WasiWinitEventLoopProxy, SurfaceCtxView, SurfaceFrameBufferCtx,
     SurfaceFrameBufferCtxView, SurfaceWebgpuCtx, SurfaceWebgpuCtxView,
 };
-use wasi_webgpu_wasmtime::{WasiWebGpuCtx, WasiWebGpuCtxView};
+use wasi_webgpu_wasmtime::{WasiWebGpuCtx, WasiWebGpuCtxView, WasiWebGpuOptions};
 use wasmtime::{
     component::{Component, Linker},
     error::Context,
@@ -33,6 +33,7 @@ wasmtime::component::bindgen!({
 
 struct HostState {
     instance: Arc<wgpu_core::global::Global>,
+    webgpu_options: WasiWebGpuOptions,
     main_thread_proxy: Arc<surface_wasmtime::winit::WasiWinitEventLoopProxy>,
 }
 
@@ -50,6 +51,9 @@ impl HostState {
                 },
                 None,
             )),
+            // Hosts targeting low-memory GPUs can set
+            // `device_memory_hints: wgpu_types::MemoryHints::MemoryUsage` here.
+            webgpu_options: WasiWebGpuOptions::default(),
             main_thread_proxy: Arc::new(main_thread_proxy),
         }
     }
@@ -57,6 +61,7 @@ impl HostState {
         WorkloadState {
             table: ResourceTable::new(),
             instance: Arc::clone(&self.instance),
+            webgpu_options: self.webgpu_options.clone(),
             main_thread_proxy: Arc::clone(&self.main_thread_proxy),
         }
     }
@@ -65,6 +70,7 @@ impl HostState {
 struct WorkloadState {
     table: ResourceTable,
     instance: Arc<wgpu_core::global::Global>,
+    webgpu_options: WasiWebGpuOptions,
     main_thread_proxy: Arc<WasiWinitEventLoopProxy>,
 }
 
@@ -77,6 +83,7 @@ impl WasiWebGpuCtxView for WorkloadState {
         WasiWebGpuCtx {
             instance: &self.instance,
             table: &mut self.table,
+            options: &self.webgpu_options,
         }
     }
 }

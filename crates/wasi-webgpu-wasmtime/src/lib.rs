@@ -103,6 +103,26 @@ pub struct WasiWebGpuCtx<'a> {
     // wrapped in arc to allow cloning for async. might be able to remove
     pub instance: &'a Arc<wgpu_core::global::Global>,
     pub table: &'a mut wasmtime_wasi::ResourceTable,
+    /// Host policy that WebGPU gives the guest no way to express.
+    pub options: &'a WasiWebGpuOptions,
+}
+
+/// Host-side options for the wasi:webgpu implementation.
+///
+/// These cover knobs that wgpu exposes but the WebGPU API (and therefore the
+/// guest) does not. [`Default`] matches wgpu's own defaults, so most embedders
+/// never need to touch this.
+#[derive(Clone, Debug, Default)]
+pub struct WasiWebGpuOptions {
+    /// Memory allocation strategy passed to wgpu on every `request-device`.
+    ///
+    /// `GPUDeviceDescriptor` has no memory-hints field, so this is the only
+    /// lever. The default (`Performance`) makes wgpu's Vulkan backend reserve
+    /// large starting allocations that low-memory adapters (e.g. Broadcom V3D
+    /// on a Raspberry Pi) cannot satisfy, failing `request-device` with
+    /// `OutOfMemory`. Hosts that target such hardware should set
+    /// [`wgpu_types::MemoryHints::MemoryUsage`].
+    pub device_memory_hints: wgpu_types::MemoryHints,
 }
 
 struct HasWasiWebGpuCtx;
