@@ -860,6 +860,35 @@ impl<T: WasiWebGpuView> webgpu::HostGpuRenderPipeline for WasiWebGpuImpl<T> {
     }
 }
 
+/// Maps a wgpu device-creation failure onto the WIT `request-device-error`
+/// instead of aborting the host.
+///
+/// https://www.w3.org/TR/webgpu/#dom-gpuadapter-requestdevice
+/// - step 1: `requiredFeatures` not a subset of the adapter's -> TypeError
+/// - step 3: `requiredLimits` not satisfiable -> OperationError
+/// - "the user agent otherwise cannot fulfill the request": the spec resolves
+///   with an already-lost device. This interface has no way to hand back a
+///   lost device, so every other failure (OutOfMemory on a low-memory
+///   adapter, Lost, backend init failures) is reported as an OperationError.
+///   The wgpu error enums are `#[non_exhaustive]`, so the wildcard arm is
+///   required; nothing here panics.
+fn map_request_device_error(
+    err: wgpu_core::instance::RequestDeviceError,
+) -> webgpu::RequestDeviceError {
+    use wgpu_core::instance::RequestDeviceError as CoreError;
+    let message = err.to_string();
+    let kind = match err {
+        CoreError::UnsupportedFeature(_) | CoreError::ExperimentalFeaturesNotEnabled(_) => {
+            webgpu::RequestDeviceErrorKind::TypeError
+        }
+        CoreError::LimitsExceeded(_) | CoreError::Device(_) => {
+            webgpu::RequestDeviceErrorKind::OperationError
+        }
+        _ => webgpu::RequestDeviceErrorKind::OperationError,
+    };
+    webgpu::RequestDeviceError { kind, message }
+}
+
 impl<T: WasiWebGpuView> webgpu::HostGpuAdapter for WasiWebGpuImpl<T> {
     fn request_device(
         &mut self,
@@ -869,15 +898,18 @@ impl<T: WasiWebGpuView> webgpu::HostGpuAdapter for WasiWebGpuImpl<T> {
         let adapter_id = *self.table().get(&adapter).unwrap();
         let options = self.webgpu_options();
 
-        let (device_id, queue_id) = self
-            .instance()
-            .adapter_request_device(
-                adapter_id,
-                &device_descriptor(descriptor, self.table(), &options),
-                None,
-                None,
-            )
-            .unwrap();
+        // A failed device creation is reported to the guest as the WIT
+        // `request-device-error`; it must never abort the host (a low-memory
+        // adapter that cannot satisfy the allocation is a normal outcome).
+        let (device_id, queue_id) = match self.instance().adapter_request_device(
+            adapter_id,
+            &device_descriptor(descriptor, self.table(), &options),
+            None,
+            None,
+        ) {
+            Ok(ids) => ids,
+            Err(err) => return Err(map_request_device_error(err)),
+        };
 
         let device = self
             .table()
@@ -2853,4 +2885,49 @@ mod tests {
             MemoryHints::MemoryUsage
         ));
     }
+}
+
+#[cfg(test)]
+mod request_device_error_tests {
+    use super::*;
+    use webgpu::RequestDeviceErrorKind as Kind;
+    use wgpu_core::device::DeviceError;
+    use wgpu_core::instance::RequestDeviceError as CoreError;
+
+    #[test]
+    fn out_of_memory_reaches_the_guest_as_operation_error() {
+        // The failure low-memory adapters (Raspberry Pi V3D) hit at device
+        // creation. Before this mapping it aborted the host process.
+        let mapped = map_request_device_error(CoreError::Device(DeviceError::OutOfMemory));
+        assert!(matches!(mapped.kind, Kind::OperationError));
+        assert!(!mapped.message.is_empty());
+    }
+
+    #[test]
+    fn lost_device_reaches_the_guest_as_operation_error() {
+        let mapped = map_request_device_error(CoreError::Device(DeviceError::Lost));
+        assert!(matches!(mapped.kind, Kind::OperationError));
+    }
+
+    #[test]
+    fn unsupported_feature_is_a_type_error_per_spec() {
+        // https://www.w3.org/TR/webgpu/#dom-gpuadapter-requestdevice step 1:
+        // requiredFeatures not a subset of adapter features -> TypeError.
+        let mapped =
+            map_request_device_error(CoreError::UnsupportedFeature(wgpu_types::Features::empty()));
+        assert!(matches!(mapped.kind, Kind::TypeError));
+    }
+
+    #[test]
+    fn experimental_features_not_enabled_is_a_type_error() {
+        let mapped = map_request_device_error(CoreError::ExperimentalFeaturesNotEnabled(
+            wgpu_types::Features::empty(),
+        ));
+        assert!(matches!(mapped.kind, Kind::TypeError));
+    }
+
+    // LimitsExceeded(FailedLimit) cannot be constructed here (private fields);
+    // spec step 3 says OperationError and the arm is explicit in the mapping.
+    // The wgpu enums are #[non_exhaustive], so the wildcard arm (also
+    // OperationError) is what keeps a future wgpu variant from ever panicking.
 }
