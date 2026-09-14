@@ -15,8 +15,47 @@ use crate::{
     to_core_conversions::ToCore,
     wasi::{io::poll, webgpu::webgpu},
     wrapper_types::{Buffer, ComputePassEncoder, Device, RenderBundleEncoder, RenderPassEncoder},
-    AbstractBuffer, MainThreadSpawner, WasiWebGpuImpl, WasiWebGpuView, WebGpuSurface,
+    AbstractBuffer, MainThreadSpawner, WasiWebGpuImpl, WasiWebGpuOptions, WasiWebGpuView,
+    WebGpuSurface,
 };
+
+/// Builds the wgpu device descriptor for `request-device`.
+///
+/// Lives here rather than in `to_core_conversions` because `memory_hints` is
+/// not part of WebGPU's `GPUDeviceDescriptor`: it comes from the host's
+/// [`WasiWebGpuOptions`], not from the guest. A missing guest descriptor is
+/// treated as an empty one, so the host option applies either way.
+fn device_descriptor<'a>(
+    descriptor: Option<webgpu::GpuDeviceDescriptor>,
+    table: &wasmtime::component::ResourceTable,
+    options: &WasiWebGpuOptions,
+) -> wgpu_types::DeviceDescriptor<wgpu_core::Label<'a>> {
+    // https://www.w3.org/TR/webgpu/#gpudevicedescriptor
+    let descriptor = descriptor.unwrap_or(webgpu::GpuDeviceDescriptor {
+        required_features: None,
+        required_limits: None,
+        default_queue: None,
+        label: None,
+    });
+    wgpu_types::DeviceDescriptor {
+        label: descriptor.label.map(|l| l.into()),
+        required_features: descriptor
+            .required_features
+            .map(|f| f.to_core(table))
+            .unwrap_or_default(),
+        required_limits: descriptor
+            .required_limits
+            .map(|limit| table.get(&limit).unwrap().to_core(table))
+            .unwrap_or(wgpu_types::Limits::defaults()),
+        // TODO: use descriptor.default_queue?
+        // memory_hints is not present in WebGPU; it is host policy.
+        memory_hints: options.device_memory_hints.clone(),
+        // trace is not present in WebGPU
+        trace: wgpu_types::Trace::default(),
+        // Don't enable any experimental features
+        experimental_features: wgpu_types::ExperimentalFeatures::disabled(),
+    }
+}
 
 impl<T: WasiWebGpuView> webgpu::Host for WasiWebGpuImpl<T> {
     fn get_gpu(&mut self) -> Resource<webgpu::Gpu> {
@@ -828,14 +867,13 @@ impl<T: WasiWebGpuView> webgpu::HostGpuAdapter for WasiWebGpuImpl<T> {
         descriptor: Option<webgpu::GpuDeviceDescriptor>,
     ) -> Result<Resource<webgpu::GpuDevice>, webgpu::RequestDeviceError> {
         let adapter_id = *self.table().get(&adapter).unwrap();
+        let options = self.webgpu_options();
 
         let (device_id, queue_id) = self
             .instance()
             .adapter_request_device(
                 adapter_id,
-                &descriptor
-                    .map(|d| d.to_core(self.table()))
-                    .unwrap_or(wgpu_types::DeviceDescriptor::default()),
+                &device_descriptor(descriptor, self.table(), &options),
                 None,
                 None,
             )
@@ -2710,5 +2748,109 @@ fn core_result_t<T, E>((t, error): (T, Option<E>)) -> Result<T, E> {
     match error {
         Some(error) => Err(error),
         None => Ok(t),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::WasiWebGpuOptions;
+    use wasmtime::component::ResourceTable;
+    use wgpu_types::MemoryHints;
+
+    fn host_options(device_memory_hints: MemoryHints) -> WasiWebGpuOptions {
+        WasiWebGpuOptions {
+            device_memory_hints,
+        }
+    }
+
+    #[test]
+    fn default_options_keep_wgpu_default_memory_hints() {
+        // Embedders that do nothing get wgpu's own default (`Performance`).
+        assert!(matches!(
+            WasiWebGpuOptions::default().device_memory_hints,
+            MemoryHints::Performance
+        ));
+    }
+
+    #[test]
+    fn device_descriptor_uses_host_memory_hints_when_guest_passes_descriptor() {
+        let table = ResourceTable::new();
+        let guest = webgpu::GpuDeviceDescriptor {
+            required_features: None,
+            required_limits: None,
+            default_queue: None,
+            label: Some("guest".to_string()),
+        };
+        let core = device_descriptor(Some(guest), &table, &host_options(MemoryHints::MemoryUsage));
+        assert!(matches!(core.memory_hints, MemoryHints::MemoryUsage));
+        assert_eq!(core.label.as_deref(), Some("guest"));
+    }
+
+    #[test]
+    fn device_descriptor_uses_host_memory_hints_when_guest_passes_none() {
+        // `request-device` with no descriptor must still honor the host option;
+        // the hint is host policy, not something the guest can express.
+        let table = ResourceTable::new();
+        let core = device_descriptor(None, &table, &host_options(MemoryHints::MemoryUsage));
+        assert!(matches!(core.memory_hints, MemoryHints::MemoryUsage));
+        // Everything else stays at the wgpu defaults, as it did before.
+        assert_eq!(core.required_limits, wgpu_types::Limits::defaults());
+        assert!(core.required_features.is_empty());
+        assert!(core.label.is_none());
+    }
+
+    // The linker never sees the embedder's type directly: it sees
+    // `WasiWebGpuImpl<&mut T>`. If the wrapper impls fall through to the trait
+    // default instead of forwarding, the embedder's option is silently ignored.
+    struct NoSpawner;
+    impl MainThreadSpawner for NoSpawner {
+        async fn spawn<F, R>(&self, f: F) -> R
+        where
+            F: FnOnce() -> R + Send + 'static,
+            R: Send + 'static,
+        {
+            f()
+        }
+    }
+
+    struct Embedder {
+        table: ResourceTable,
+        options: WasiWebGpuOptions,
+    }
+    impl IoView for Embedder {
+        fn table(&mut self) -> &mut ResourceTable {
+            &mut self.table
+        }
+    }
+    impl WasiWebGpuView for Embedder {
+        fn instance(&self) -> Arc<wgpu_core::global::Global> {
+            unreachable!("not needed to read options")
+        }
+        fn ui_thread_spawner(&self) -> Box<impl MainThreadSpawner> {
+            Box::new(NoSpawner)
+        }
+        fn webgpu_options(&self) -> WasiWebGpuOptions {
+            self.options.clone()
+        }
+    }
+
+    #[test]
+    fn wrapper_forwards_embedder_options_to_the_host_impl() {
+        let mut embedder = Embedder {
+            table: ResourceTable::new(),
+            options: host_options(MemoryHints::MemoryUsage),
+        };
+        // Same shape add_to_linker builds: WasiWebGpuImpl over &mut T.
+        let wrapped = WasiWebGpuImpl(&mut embedder);
+        assert!(matches!(
+            wrapped.webgpu_options().device_memory_hints,
+            MemoryHints::MemoryUsage
+        ));
+        let boxed: Box<Embedder> = Box::new(embedder);
+        assert!(matches!(
+            boxed.webgpu_options().device_memory_hints,
+            MemoryHints::MemoryUsage
+        ));
     }
 }

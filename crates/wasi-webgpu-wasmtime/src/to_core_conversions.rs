@@ -688,35 +688,6 @@ impl<'a> ToCore<wgpu_types::BufferDescriptor<wgpu_core::Label<'a>>>
     }
 }
 
-impl<'a> ToCore<wgpu_types::DeviceDescriptor<wgpu_core::Label<'a>>>
-    for webgpu::GpuDeviceDescriptor
-{
-    fn to_core(self, table: &ResourceTable) -> wgpu_types::DeviceDescriptor<wgpu_core::Label<'a>> {
-        wgpu_types::DeviceDescriptor {
-            label: self.label.map(|l| l.into()),
-            required_features: self
-                .required_features
-                .map(|f| f.to_core(table))
-                .unwrap_or_default(),
-            required_limits: self
-                .required_limits
-                .map(|limit| table.get(&limit).unwrap().to_core(table))
-                .unwrap_or(wgpu_types::Limits::defaults()),
-            // TODO: use self.default_queue?
-            // memory_hints is not present in WebGPU
-            // Default to MemoryUsage so device creation fits memory-constrained
-            // GPUs (e.g. the Raspberry Pi's V3D). The Performance hint makes
-            // wgpu-hal's gpu_alloc use a 128 MiB starting block, which fails to
-            // allocate there; WebGPU has no memory-hints field for guests to set.
-            memory_hints: wgpu_types::MemoryHints::MemoryUsage,
-            // trace is not present in WebGPU
-            trace: wgpu_types::Trace::default(),
-            // Don't enable any experimental features
-            experimental_features: wgpu_types::ExperimentalFeatures::disabled(),
-        }
-    }
-}
-
 impl ToCore<wgpu_types::Features> for Vec<webgpu::GpuFeatureName> {
     fn to_core(self, _table: &ResourceTable) -> wgpu_types::Features {
         let features_webgpu = self

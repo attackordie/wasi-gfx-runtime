@@ -96,6 +96,30 @@ pub trait WasiWebGpuView: IoView + Send {
     /// Provide the ability to run closure on the UI thread.
     /// On platforms that don't require UI to run on the UI thread, this can just execute in place.
     fn ui_thread_spawner(&self) -> Box<impl MainThreadSpawner>;
+
+    /// Host policy that WebGPU gives the guest no way to express.
+    /// The default matches wgpu's own defaults; override to change it.
+    fn webgpu_options(&self) -> WasiWebGpuOptions {
+        WasiWebGpuOptions::default()
+    }
+}
+
+/// Host-side options for the wasi:webgpu implementation.
+///
+/// These cover knobs that wgpu exposes but the WebGPU API (and therefore the
+/// guest) does not. [`Default`] matches wgpu's own defaults, so most embedders
+/// never need to touch this.
+#[derive(Clone, Debug, Default)]
+pub struct WasiWebGpuOptions {
+    /// Memory allocation strategy passed to wgpu on every `request-device`.
+    ///
+    /// `GPUDeviceDescriptor` has no memory-hints field, so this is the only
+    /// lever. The default (`Performance`) makes wgpu's Vulkan backend reserve
+    /// large starting allocations that low-memory adapters (e.g. Broadcom V3D
+    /// on a Raspberry Pi) cannot satisfy, failing `request-device` with
+    /// `OutOfMemory`. Hosts that target such hardware should set
+    /// [`wgpu_types::MemoryHints::MemoryUsage`].
+    pub device_memory_hints: wgpu_types::MemoryHints,
 }
 
 #[repr(transparent)]
@@ -114,6 +138,10 @@ impl<T: ?Sized + WasiWebGpuView> WasiWebGpuView for &mut T {
     fn ui_thread_spawner(&self) -> Box<impl MainThreadSpawner> {
         T::ui_thread_spawner(self)
     }
+
+    fn webgpu_options(&self) -> WasiWebGpuOptions {
+        T::webgpu_options(self)
+    }
 }
 impl<T: ?Sized + WasiWebGpuView> WasiWebGpuView for Box<T> {
     fn instance(&self) -> Arc<wgpu_core::global::Global> {
@@ -123,6 +151,10 @@ impl<T: ?Sized + WasiWebGpuView> WasiWebGpuView for Box<T> {
     fn ui_thread_spawner(&self) -> Box<impl MainThreadSpawner> {
         T::ui_thread_spawner(self)
     }
+
+    fn webgpu_options(&self) -> WasiWebGpuOptions {
+        T::webgpu_options(self)
+    }
 }
 impl<T: WasiWebGpuView> WasiWebGpuView for WasiWebGpuImpl<T> {
     fn instance(&self) -> Arc<wgpu_core::global::Global> {
@@ -131,6 +163,10 @@ impl<T: WasiWebGpuView> WasiWebGpuView for WasiWebGpuImpl<T> {
 
     fn ui_thread_spawner(&self) -> Box<impl MainThreadSpawner> {
         T::ui_thread_spawner(&self.0)
+    }
+
+    fn webgpu_options(&self) -> WasiWebGpuOptions {
+        T::webgpu_options(&self.0)
     }
 }
 
