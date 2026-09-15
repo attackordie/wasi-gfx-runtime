@@ -51,8 +51,6 @@ impl HostState {
                 },
                 None,
             )),
-            // Hosts targeting low-memory GPUs can set
-            // `device_memory_hints: wgpu_types::MemoryHints::MemoryUsage` here.
             webgpu_options: WasiWebGpuOptions::default(),
             main_thread_proxy: Arc::new(main_thread_proxy),
         }

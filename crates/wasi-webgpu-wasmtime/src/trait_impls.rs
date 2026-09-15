@@ -15,46 +15,8 @@ use crate::{
         WgslLanguageFeatures,
     },
     wasi::webgpu::webgpu,
-    WasiWebGpuCtx, WasiWebGpuCtxView, WasiWebGpuOptions, PREFERRED_CANVAS_FORMAT,
+    WasiWebGpuCtx, WasiWebGpuCtxView, PREFERRED_CANVAS_FORMAT,
 };
-
-/// Builds the wgpu device descriptor for `request-device`.
-///
-/// Lives here rather than in `to_core_conversions` because `memory_hints` is
-/// not part of WebGPU's `GPUDeviceDescriptor`: it comes from the host's
-/// [`WasiWebGpuOptions`], not from the guest. A missing guest descriptor is
-/// treated as an empty one, so the host option applies either way.
-fn device_descriptor<'a>(
-    descriptor: Option<webgpu::GpuDeviceDescriptor>,
-    table: &wasmtime::component::ResourceTable,
-    options: &WasiWebGpuOptions,
-) -> wgpu_types::DeviceDescriptor<wgpu_core::Label<'a>> {
-    // https://www.w3.org/TR/webgpu/#gpudevicedescriptor
-    let descriptor = descriptor.unwrap_or(webgpu::GpuDeviceDescriptor {
-        required_features: None,
-        required_limits: None,
-        default_queue: None,
-        label: None,
-    });
-    wgpu_types::DeviceDescriptor {
-        label: descriptor.label.map(|l| l.into()),
-        required_features: descriptor
-            .required_features
-            .map(|f| f.to_core(table))
-            .unwrap_or_default(),
-        required_limits: descriptor
-            .required_limits
-            .map(|limit| table.get(&limit).unwrap().to_core(table))
-            .unwrap_or(wgpu_types::Limits::defaults()),
-        // TODO: use descriptor.default_queue?
-        // memory_hints is not present in WebGPU; it is host policy.
-        memory_hints: options.device_memory_hints.clone(),
-        // trace is not present in WebGPU
-        trace: wgpu_types::Trace::default(),
-        // Don't enable any experimental features
-        experimental_features: wgpu_types::ExperimentalFeatures::disabled(),
-    }
-}
 
 impl<'a> webgpu::Host for WasiWebGpuCtx<'a> {
     fn get_gpu(&mut self) -> wasmtime::Result<Resource<webgpu::Gpu>> {
@@ -965,35 +927,6 @@ impl<'a> webgpu::HostGpuAdapter for WasiWebGpuCtx<'a> {
     }
 }
 
-/// Maps a wgpu device-creation failure onto the WIT `request-device-error`
-/// instead of aborting the host.
-///
-/// https://www.w3.org/TR/webgpu/#dom-gpuadapter-requestdevice
-/// - step 1: `requiredFeatures` not a subset of the adapter's -> TypeError
-/// - step 3: `requiredLimits` not satisfiable -> OperationError
-/// - "the user agent otherwise cannot fulfill the request": the spec resolves
-///   with an already-lost device. This interface has no way to hand back a
-///   lost device, so every other failure (OutOfMemory on a low-memory
-///   adapter, Lost, backend init failures) is reported as an OperationError.
-///   The wgpu error enums are `#[non_exhaustive]`, so the wildcard arm is
-///   required; nothing here panics.
-fn map_request_device_error(
-    err: wgpu_core::instance::RequestDeviceError,
-) -> webgpu::RequestDeviceError {
-    use wgpu_core::instance::RequestDeviceError as CoreError;
-    let message = err.to_string();
-    let kind = match err {
-        CoreError::UnsupportedFeature(_) | CoreError::ExperimentalFeaturesNotEnabled(_) => {
-            webgpu::RequestDeviceErrorKind::TypeError
-        }
-        CoreError::LimitsExceeded(_) | CoreError::Device(_) => {
-            webgpu::RequestDeviceErrorKind::OperationError
-        }
-        _ => webgpu::RequestDeviceErrorKind::OperationError,
-    };
-    webgpu::RequestDeviceError { kind, message }
-}
-
 impl<T: Send> webgpu::HostGpuAdapterWithStore<T> for crate::HasWasiWebGpuCtx {
     async fn request_device(
         accessor: &Accessor<T, Self>,
@@ -1002,19 +935,38 @@ impl<T: Send> webgpu::HostGpuAdapterWithStore<T> for crate::HasWasiWebGpuCtx {
     ) -> wasmtime::Result<Result<Resource<webgpu::GpuDevice>, webgpu::RequestDeviceError>> {
         accessor.with(|mut access| {
             let ctx = access.get();
+            let table = ctx.table;
+            let adapter = Arc::clone(table.get(&adapter)?);
 
-            let adapter = Arc::clone(ctx.table.get(&adapter)?);
+            let descriptor = match descriptor {
+                Some(desc) => wgpu_types::DeviceDescriptor {
+                    label: desc.label.map(|l| l.into()),
+                    required_features: desc
+                        .required_features
+                        .map(|f| f.to_core(table))
+                        .unwrap_or_default(),
+                    required_limits: desc
+                        .required_limits
+                        .map(|limit| table.get(&limit).unwrap().to_core(table))
+                        .unwrap_or(wgpu_types::Limits::defaults()),
+                    // TODO: use descriptor.default_queue?
+                    // trace is not present in WebGPU
+                    trace: wgpu_types::Trace::default(),
+                    // Don't enable any experimental features
+                    experimental_features: wgpu_types::ExperimentalFeatures::disabled(),
+                    // memory_hints is not present in WebGPU, comes from options
+                    memory_hints: ctx.options.device_memory_hints.clone(),
+                },
+                None => wgpu_types::DeviceDescriptor::default(),
+            };
 
-            let device_queue_result = ctx.instance.adapter_request_device(
-                *adapter,
-                &device_descriptor(descriptor, ctx.table, ctx.options),
-                None,
-                None,
-            );
+            let device_queue_result =
+                ctx.instance
+                    .adapter_request_device(*adapter, &descriptor, None, None);
 
             Ok(match device_queue_result {
                 Ok((device_id, queue_id)) => {
-                    let device = ctx.table.push(Device {
+                    let device = table.push(Device {
                         device: device_id,
                         queue: Arc::new(queue_id),
                         adapter,
@@ -1023,7 +975,38 @@ impl<T: Send> webgpu::HostGpuAdapterWithStore<T> for crate::HasWasiWebGpuCtx {
                     Ok(device)
                 }
 
-                Err(err) => Err(map_request_device_error(err)),
+                Err(err) => {
+                    let message = err.to_string();
+                    // https://www.w3.org/TR/webgpu/#dom-gpuadapter-requestdevice
+                    match err {
+                        wgpu_core::instance::RequestDeviceError::UnsupportedFeature(_) => {
+                            // From the spec:
+                            // > 1. If any of the following requirements are unmet:
+                            // >  - The set of values in descriptor.requiredFeatures must be a subset of those in adapter.[[features]].
+                            // > Then issue the following steps on contentTimeline and return:
+                            // >  1. Reject promise with a TypeError.
+                            Err(webgpu::RequestDeviceError {
+                                kind: webgpu::RequestDeviceErrorKind::TypeError,
+                                message,
+                            })
+                        }
+                        wgpu_core::instance::RequestDeviceError::LimitsExceeded(_) => {
+                            // From the spec:
+                            // > 2. All of the requirements in the following steps must be met.
+                            // >  2. For each [key, value] in descriptor.requiredLimits for which value is not undefined:
+                            // >   1. key must be the name of a member of supported limits.
+                            // >   2. value must be no better than adapter.[[limits]][key].
+                            // >   3. If key’s class is alignment, value must be a power of 2 less than 232.
+                            // > 3. If any are unmet, issue the following steps on contentTimeline and return:
+                            // >  1. Reject promise with an OperationError.
+                            Err(webgpu::RequestDeviceError {
+                                kind: webgpu::RequestDeviceErrorKind::OperationError,
+                                message,
+                            })
+                        }
+                        err => todo!("unhandled request device error: {:#?}", err),
+                    }
+                }
             })
         })
     }
@@ -3201,98 +3184,4 @@ impl<'a> webgpu::HostGpuSupportedLimits for WasiWebGpuCtx<'a> {
         self.table.delete(limits)?;
         Ok(())
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use wasmtime::component::ResourceTable;
-    use wgpu_types::MemoryHints;
-
-    fn host_options(device_memory_hints: MemoryHints) -> WasiWebGpuOptions {
-        WasiWebGpuOptions {
-            device_memory_hints,
-        }
-    }
-
-    #[test]
-    fn default_options_keep_wgpu_default_memory_hints() {
-        // Embedders that do nothing get wgpu's own default (`Performance`).
-        assert!(matches!(
-            WasiWebGpuOptions::default().device_memory_hints,
-            MemoryHints::Performance
-        ));
-    }
-
-    #[test]
-    fn device_descriptor_uses_host_memory_hints_when_guest_passes_descriptor() {
-        let table = ResourceTable::new();
-        let guest = webgpu::GpuDeviceDescriptor {
-            required_features: None,
-            required_limits: None,
-            default_queue: None,
-            label: Some("guest".to_string()),
-        };
-        let core = device_descriptor(Some(guest), &table, &host_options(MemoryHints::MemoryUsage));
-        assert!(matches!(core.memory_hints, MemoryHints::MemoryUsage));
-        assert_eq!(core.label.as_deref(), Some("guest"));
-    }
-
-    #[test]
-    fn device_descriptor_uses_host_memory_hints_when_guest_passes_none() {
-        // `request-device` with no descriptor must still honor the host option;
-        // the hint is host policy, not something the guest can express.
-        let table = ResourceTable::new();
-        let core = device_descriptor(None, &table, &host_options(MemoryHints::MemoryUsage));
-        assert!(matches!(core.memory_hints, MemoryHints::MemoryUsage));
-        // Everything else stays at the wgpu defaults, as it did before.
-        assert_eq!(core.required_limits, wgpu_types::Limits::defaults());
-        assert!(core.required_features.is_empty());
-        assert!(core.label.is_none());
-    }
-}
-
-#[cfg(test)]
-mod request_device_error_tests {
-    use super::*;
-    use webgpu::RequestDeviceErrorKind as Kind;
-    use wgpu_core::device::DeviceError;
-    use wgpu_core::instance::RequestDeviceError as CoreError;
-
-    #[test]
-    fn out_of_memory_reaches_the_guest_as_operation_error() {
-        // The failure low-memory adapters (Raspberry Pi V3D) hit at device
-        // creation. Before this mapping it aborted the host process.
-        let mapped = map_request_device_error(CoreError::Device(DeviceError::OutOfMemory));
-        assert!(matches!(mapped.kind, Kind::OperationError));
-        assert!(!mapped.message.is_empty());
-    }
-
-    #[test]
-    fn lost_device_reaches_the_guest_as_operation_error() {
-        let mapped = map_request_device_error(CoreError::Device(DeviceError::Lost));
-        assert!(matches!(mapped.kind, Kind::OperationError));
-    }
-
-    #[test]
-    fn unsupported_feature_is_a_type_error_per_spec() {
-        // https://www.w3.org/TR/webgpu/#dom-gpuadapter-requestdevice step 1:
-        // requiredFeatures not a subset of adapter features -> TypeError.
-        let mapped =
-            map_request_device_error(CoreError::UnsupportedFeature(wgpu_types::Features::empty()));
-        assert!(matches!(mapped.kind, Kind::TypeError));
-    }
-
-    #[test]
-    fn experimental_features_not_enabled_is_a_type_error() {
-        let mapped = map_request_device_error(CoreError::ExperimentalFeaturesNotEnabled(
-            wgpu_types::Features::empty(),
-        ));
-        assert!(matches!(mapped.kind, Kind::TypeError));
-    }
-
-    // LimitsExceeded(FailedLimit) cannot be constructed here (private fields);
-    // spec step 3 says OperationError and the arm is explicit in the mapping.
-    // The wgpu enums are #[non_exhaustive], so the wildcard arm (also
-    // OperationError) is what keeps a future wgpu variant from ever panicking.
 }
