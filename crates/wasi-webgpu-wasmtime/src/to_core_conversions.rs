@@ -913,9 +913,18 @@ impl ToCore<wgpu_types::Limits> for &webgpu::RecordOptionGpuSize64 {
                         }
                     }
                     "maxinterstageshadervariables" => {
-                        if let Some(_value) = value {
-                            // TODO: enable once added to wgpu
-                            // limits.max_inter_stage_shader_variables = *value as u32;
+                        // The "enable once added to wgpu" TODO here was stale:
+                        // wgpu-types 29 has the field. Leaving it unapplied made
+                        // this limit permanently pinned to Limits::defaults()'s
+                        // 16, which NO downlevel GPU can satisfy -- wgpu's own
+                        // downlevel_defaults use 15. Raspberry Pi V3D reports 15,
+                        // so every request_device on that class of hardware failed
+                        // with "Limit 'max_inter_stage_shader_variables' value 16
+                        // is better than allowed 15", regardless of what the guest
+                        // requested. Measured on a Pi 500 (V3DV Mesa 24.2.8),
+                        // 2026-09-22.
+                        if let Some(value) = value {
+                            limits.max_inter_stage_shader_variables = *value as u32;
                         }
                     }
                     "maxcolorattachments" => {
