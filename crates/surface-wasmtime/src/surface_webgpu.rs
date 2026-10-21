@@ -31,6 +31,9 @@ pub struct Context {
 
 pub(crate) struct ContextConfiguration {
     device: Resource<wasi_webgpu_wasmtime::Device>,
+    // What configure passed to wgpu-core, so an Outdated or Lost acquire can
+    // reconfigure the surface without the guest.
+    surface_config: wgpu_types::SurfaceConfiguration<Vec<wgpu_types::TextureFormat>>,
 }
 
 // linker connection
@@ -105,28 +108,42 @@ impl<'a, S: MainThreadSpawner> surface_webgpu::HostContext for SurfaceWebgpuCtx<
 
         let context = self.table.get_mut(&context)?;
 
-        let err = self.instance.surface_configure(
-            context.surface_id,
-            device_id,
-            &wgpu_types::SurfaceConfiguration {
-                // present in WebGPU, same defaults https://www.w3.org/TR/webgpu/#dictdef-gpucanvasconfiguration
-                format: configuration.format.into(),
-                usage: configuration.usage.unwrap_or(wasi_webgpu_wasmtime::wasi::webgpu::webgpu::GpuTextureUsage::RENDER_ATTACHMENT).try_into().unwrap(),
-                view_formats: configuration.view_formats.into_iter().flatten().map(|f| f.into()).collect(),
-                alpha_mode: configuration.alpha_mode.unwrap_or(wasi_webgpu_wasmtime::wasi::webgpu::webgpu::GpuCanvasAlphaMode::Opaque).into(),
-                // not present in WebGPU
-                width: context.surface.width(),
-                height: context.surface.height(),
-                present_mode: wgpu_types::PresentMode::default(),
-                desired_maximum_frame_latency: 2,
-            }
-        );
+        let surface_config = wgpu_types::SurfaceConfiguration {
+            // present in WebGPU, same defaults https://www.w3.org/TR/webgpu/#dictdef-gpucanvasconfiguration
+            format: configuration.format.into(),
+            usage: configuration
+                .usage
+                .unwrap_or(
+                    wasi_webgpu_wasmtime::wasi::webgpu::webgpu::GpuTextureUsage::RENDER_ATTACHMENT,
+                )
+                .try_into()
+                .unwrap(),
+            view_formats: configuration
+                .view_formats
+                .into_iter()
+                .flatten()
+                .map(|f| f.into())
+                .collect(),
+            alpha_mode: configuration
+                .alpha_mode
+                .unwrap_or(wasi_webgpu_wasmtime::wasi::webgpu::webgpu::GpuCanvasAlphaMode::Opaque)
+                .into(),
+            // not present in WebGPU
+            width: context.surface.width(),
+            height: context.surface.height(),
+            present_mode: wgpu_types::PresentMode::default(),
+            desired_maximum_frame_latency: 2,
+        };
+        let err = self
+            .instance
+            .surface_configure(context.surface_id, device_id, &surface_config);
         if let Some(err) = err {
             bail!("{err:#?}")
         }
 
         context.configuration = Some(ContextConfiguration {
             device: configuration.device,
+            surface_config,
         });
         Ok(())
     }
@@ -147,14 +164,53 @@ impl<'a, S: MainThreadSpawner> surface_webgpu::HostContext for SurfaceWebgpuCtx<
             bail!("Not configured")
         };
 
-        let texture_id: wgpu_core::id::TextureId = self
-            .instance
-            .surface_get_current_texture(context.surface_id, None)
-            .unwrap()
-            .texture
-            .unwrap();
-
         let device = self.table.get(&configuration.device)?;
+
+        // wgpu-core returns no texture with status Timeout, Occluded, Outdated
+        // or Lost (Outdated after a resize, for example). Outdated or Lost:
+        // reconfigure with the stored configuration at the surface's current
+        // size and acquire once more. Timeout or Occluded: acquire once more.
+        // If there is still no texture, return an error instead of panicking
+        // the host.
+        let instance = self.instance;
+        let surface_id = context.surface_id;
+        let first = match instance.surface_get_current_texture(surface_id, None) {
+            Ok(output) => output,
+            Err(err) => bail!("surface acquire failed: {err:#?}"),
+        };
+        let texture_id: wgpu_core::id::TextureId = match first.texture {
+            Some(texture_id) => texture_id,
+            None => {
+                let status = first.status;
+                match status {
+                    wgpu_types::SurfaceStatus::Outdated | wgpu_types::SurfaceStatus::Lost => {
+                        let mut config = configuration.surface_config.clone();
+                        config.width = context.surface.width();
+                        config.height = context.surface.height();
+                        if let Some(err) =
+                            instance.surface_configure(surface_id, *device.device_id(), &config)
+                        {
+                            bail!("surface acquire returned {status:?} with no texture and the reconfigure failed: {err:#?}")
+                        }
+                    }
+                    wgpu_types::SurfaceStatus::Timeout | wgpu_types::SurfaceStatus::Occluded => {}
+                    _ => bail!("surface acquire returned {status:?} with no texture"),
+                }
+                match instance.surface_get_current_texture(surface_id, None) {
+                    Ok(wgpu_core::present::SurfaceOutput {
+                        texture: Some(texture_id),
+                        ..
+                    }) => texture_id,
+                    Ok(again) => bail!(
+                        "surface acquire returned {:?} with no texture on the retry after {status:?}",
+                        again.status
+                    ),
+                    Err(err) => {
+                        bail!("surface acquire failed on the retry after {status:?}: {err:#?}")
+                    }
+                }
+            }
+        };
 
         // SAFETY: surface_get_current_texture will only give back a texture connected to the configured device.
         let texture = unsafe { device.connect_texture(texture_id) };
