@@ -1004,7 +1004,26 @@ impl<T: Send> webgpu::HostGpuAdapterWithStore<T> for crate::HasWasiWebGpuCtx {
                                 message,
                             })
                         }
-                        err => todo!("unhandled request device error: {:#?}", err),
+                        wgpu_core::instance::RequestDeviceError::ExperimentalFeaturesNotEnabled(
+                            _,
+                        ) => {
+                            // Features were requested that are not available, the same class
+                            // of failure as step 1 above, so also a TypeError.
+                            Err(webgpu::RequestDeviceError {
+                                kind: webgpu::RequestDeviceErrorKind::TypeError,
+                                message,
+                            })
+                        }
+                        // Device(Lost), Device(OutOfMemory), TimestampNormalizerInitFailed and
+                        // any variant added later (the enum is non_exhaustive). The request was
+                        // well formed but could not be fulfilled. The spec resolves that with
+                        // an already lost device, which this interface cannot return, so
+                        // OperationError is the closest outcome. Either way the guest gets a
+                        // catchable error instead of the host panicking.
+                        _ => Err(webgpu::RequestDeviceError {
+                            kind: webgpu::RequestDeviceErrorKind::OperationError,
+                            message,
+                        }),
                     }
                 }
             })
