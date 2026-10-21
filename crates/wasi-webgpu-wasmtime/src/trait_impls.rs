@@ -1012,6 +1012,17 @@ impl<T: Send> webgpu::HostGpuAdapterWithStore<T> for crate::HasWasiWebGpuCtx {
     }
 }
 
+/// Map a wgpu-core get-mapped-range failure to the error returned to the
+/// guest. WebGPU's getMappedRange throws OperationError when the buffer has
+/// no valid mapping (for example an invalid buffer created on a lost device);
+/// before this it was a `?` that trapped the guest instead.
+fn mapped_range_error(err: wgpu_core::resource::BufferAccessError) -> webgpu::GetMappedRangeError {
+    webgpu::GetMappedRangeError {
+        kind: webgpu::GetMappedRangeErrorKind::OperationError,
+        message: err.to_string(),
+    }
+}
+
 impl<'a> webgpu::HostGpuQueue for WasiWebGpuCtx<'a> {
     fn submit(
         &mut self,
@@ -1023,7 +1034,15 @@ impl<'a> webgpu::HostGpuQueue for WasiWebGpuCtx<'a> {
             .map(|buffer| *self.table.get(&buffer).unwrap())
             .collect::<Vec<_>>();
         let queue = *(*self.table.get(&queue)?);
-        self.instance.queue_submit(queue, &command_buffers).unwrap();
+        if let Err((_, err)) = self.instance.queue_submit(queue, &command_buffers) {
+            // A submit on a lost device does nothing in WebGPU; the guest
+            // learns of the loss from map-async. Any other submit error still
+            // panics, as before.
+            use wgpu_types::error::WebGpuError;
+            if err.webgpu_error_type() != wgpu_types::error::ErrorType::DeviceLost {
+                panic!("queue submit failed: {err}");
+            }
+        }
         Ok(())
     }
 
@@ -1047,8 +1066,19 @@ impl<'a> webgpu::HostGpuQueue for WasiWebGpuCtx<'a> {
             let size = size as usize;
             data = &data[..size];
         }
-        self.instance
-            .queue_write_buffer(queue, buffer_id, buffer_offset, data)?;
+        // A failed write (a lost device, an invalid buffer) is returned to the
+        // guest as write-buffer-error operation-error, the error channel the
+        // WIT gives it, so the guest can drop the device and recover instead
+        // of trapping.
+        if let Err(err) = self
+            .instance
+            .queue_write_buffer(queue, buffer_id, buffer_offset, data)
+        {
+            return Ok(Err(webgpu::WriteBufferError {
+                kind: webgpu::WriteBufferErrorKind::OperationError,
+                message: err.to_string(),
+            }));
+        }
         Ok(Ok(()))
     }
 
@@ -1061,13 +1091,22 @@ impl<'a> webgpu::HostGpuQueue for WasiWebGpuCtx<'a> {
         size: webgpu::GpuExtent3D,
     ) -> wasmtime::Result<()> {
         let queue = *(*self.table.get(&queue)?);
-        self.instance.queue_write_texture(
+        if let Err(err) = self.instance.queue_write_texture(
             queue,
             &destination.to_core(self.table),
             &data,
             &data_layout.to_core(self.table),
             &size.to_core(self.table),
-        )?;
+        ) {
+            // write-texture-with-copy has no error channel. On a lost device
+            // it does nothing, as submit does; the guest learns of the loss
+            // from its next fallible call. Any other error still traps, as
+            // before.
+            use wgpu_types::error::WebGpuError;
+            if err.webgpu_error_type() != wgpu_types::error::ErrorType::DeviceLost {
+                return Err(err.into());
+            }
+        }
         Ok(())
     }
 
@@ -2535,10 +2574,14 @@ impl<'a> webgpu::HostGpuBuffer for WasiWebGpuCtx<'a> {
             todo!("Throw buffer not mapped error");
         }
         let buffer_id = buffer.buffer_id;
-        let (ptr, len) = self
+        let (ptr, len) = match self
             .instance
             // https://www.w3.org/TR/webgpu/#gpubuffer
-            .buffer_get_mapped_range(buffer_id, offset.unwrap_or(0), size)?;
+            .buffer_get_mapped_range(buffer_id, offset.unwrap_or(0), size)
+        {
+            Ok(range) => range,
+            Err(err) => return Ok(Err(mapped_range_error(err))),
+        };
         let data = unsafe { slice::from_raw_parts(ptr.as_ptr(), len as usize) };
         let mut output = vec![0; len as usize];
         output.copy_from_slice(data);
@@ -2557,10 +2600,14 @@ impl<'a> webgpu::HostGpuBuffer for WasiWebGpuCtx<'a> {
             todo!("Throw buffer not mapped error");
         }
         let buffer_id = buffer.buffer_id;
-        let (ptr, len) = self
+        let (ptr, len) = match self
             .instance
             // https://www.w3.org/TR/webgpu/#gpubuffer
-            .buffer_get_mapped_range(buffer_id, offset.unwrap_or(0), size)?;
+            .buffer_get_mapped_range(buffer_id, offset.unwrap_or(0), size)
+        {
+            Ok(range) => range,
+            Err(err) => return Ok(Err(mapped_range_error(err))),
+        };
         let buffer = unsafe { slice::from_raw_parts_mut(ptr.as_ptr(), len as usize) };
         buffer.copy_from_slice(&data);
         Ok(Ok(()))
@@ -2571,9 +2618,14 @@ impl<'a> webgpu::HostGpuBuffer for WasiWebGpuCtx<'a> {
         buffer: Resource<webgpu::GpuBuffer>,
     ) -> wasmtime::Result<Result<(), webgpu::UnmapError>> {
         let buffer = self.table.get_mut(&buffer)?;
-        self.instance.buffer_unmap(buffer.buffer_id)?;
+        let unmapped = self.instance.buffer_unmap(buffer.buffer_id);
         buffer.map_state = webgpu::GpuBufferMapState::Unmapped;
-        Ok(Ok(()))
+        // A failed unmap (an invalid buffer from a lost device, for example)
+        // is returned in the WIT result rather than trapping the guest.
+        Ok(unmapped.map_err(|err| webgpu::UnmapError {
+            kind: webgpu::UnmapErrorKind::AbortError,
+            message: err.to_string(),
+        }))
     }
 
     fn destroy(&mut self, buffer: Resource<webgpu::GpuBuffer>) -> wasmtime::Result<()> {
@@ -2628,7 +2680,7 @@ impl<T: Send> webgpu::HostGpuBufferWithStore<T> for crate::HasWasiWebGpuCtx {
         // https://www.w3.org/TR/webgpu/#gpubuffer
         let offset = offset.unwrap_or(0);
 
-        accessor
+        let result = accessor
             .with(|mut access| -> wasmtime::Result<_> {
                 let ctx = access.get();
                 let instance = Arc::clone(ctx.instance);
@@ -2645,15 +2697,32 @@ impl<T: Send> webgpu::HostGpuBufferWithStore<T> for crate::HasWasiWebGpuCtx {
                             resolve(Box::new(result));
                         })),
                     };
-                    instance
-                        .buffer_map_async(buffer_id, offset, size, op)
-                        .unwrap();
+                    // On failure wgpu-core has already invoked the callback
+                    // with the error, which resolves this future; the error
+                    // is returned to the guest below instead of panicking.
+                    let _ = instance.buffer_map_async(buffer_id, offset, size, op);
                     // TODO: only poll this device.
                     instance.poll_all_devices(true).unwrap();
                 })))
             })?
-            .await
-            .unwrap();
+            .await;
+
+        if let Err(err) = *result {
+            // For example a lost device (wgpu-core BufferAccessError with
+            // DeviceError::Lost). Reject as WebGPU's mapAsync does, with the
+            // buffer back in the unmapped state, so the guest can drop the
+            // device and recover instead of the host aborting.
+            accessor.with(|mut access| -> wasmtime::Result<_> {
+                let ctx = access.get();
+                let buffer = ctx.table.get_mut(&buffer)?;
+                buffer.map_state = webgpu::GpuBufferMapState::Unmapped;
+                Ok(())
+            })?;
+            return Ok(Err(webgpu::MapAsyncError {
+                kind: webgpu::MapAsyncErrorKind::OperationError,
+                message: err.to_string(),
+            }));
+        }
 
         accessor.with(|mut access| -> wasmtime::Result<_> {
             let ctx = access.get();

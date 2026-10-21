@@ -192,6 +192,15 @@ impl ErrorHandler {
         error: Option<E>,
     ) {
         if let Some(error) = error {
+            // An operation on a lost device is not an error scope or
+            // uncaptured error in WebGPU: loss is reported through the
+            // device's lost promise and failed promises (map-async), and
+            // GpuErrorKind has no device-lost case. Converting it hit the
+            // `DeviceLost => todo!()` in enum_conversions.rs and aborted the
+            // host, so a guest could never recover from a lost device.
+            if error.webgpu_error_type() == wgpu_types::error::ErrorType::DeviceLost {
+                return;
+            }
             let error_kind = error.webgpu_error_type().into();
             let error = GpuError {
                 message: error.to_string(),
